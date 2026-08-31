@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+STATE_DIR="$ROOT_DIR/.deploy"
+STATE_FILE="$STATE_DIR/current.env"
+ENV_FILE="$ROOT_DIR/.env.local"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Missing .env.local — copy the example first:"
+  echo "  cp .env.local.example .env.local"
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+[[ -n "${APP_KEY:-}" ]] || { echo "APP_KEY is not set in .env.local"; exit 1; }
+
+port_free() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -tuln | awk '{print $5}' | grep -qE "[:.]${p}$"
+  elif command -v lsof >/dev/null 2>&1; then
+    ! lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    ! (echo >/dev/tcp/127.0.0.1/"$p") >/dev/null 2>&1
+  fi
+}
+
+find_port() {
+  local p="$1"
+  local max=$((p + 200))
+  while [[ "$p" -le "$max" ]]; do
+    port_free "$p" && { echo "$p"; return; }
+    p=$((p + 1))
+  done
+  echo "no free port near $1" >&2
+  exit 1
+}
+
+DEPLOY_ID="$(date +%Y%m%d%H%M%S)-$(openssl rand -hex 3 2>/dev/null || head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+BACKEND_CONTAINER_NAME="dwd-backend-${DEPLOY_ID}"
+FRONTEND_CONTAINER_NAME="dwd-frontend-${DEPLOY_ID}"
+POSTGRES_CONTAINER_NAME="dwd-postgres-${DEPLOY_ID}"
+COMPOSE_PROJECT_NAME="dwd_${DEPLOY_ID}"
+POSTGRES_DATA_PATH="${POSTGRES_DATA_PATH:-./data/postgres}"
+DB_HOST="${DB_HOST:-postgres}"
+
+export DEPLOY_ID BACKEND_CONTAINER_NAME FRONTEND_CONTAINER_NAME
+export POSTGRES_CONTAINER_NAME COMPOSE_PROJECT_NAME POSTGRES_DATA_PATH DB_HOST
+
+mkdir -p "$POSTGRES_DATA_PATH"
+
+echo "deploy $DEPLOY_ID"
+
+# drop the previous stack if we still have a record of it
+if [[ -f "$STATE_FILE" ]]; then
+  (
+    set -a
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    set +a
+    [[ -n "${PREV_PROJECT:-}" ]] && docker compose -p "$PREV_PROJECT" --env-file "$ENV_FILE" down --remove-orphans --rmi local >/dev/null 2>&1 || true
+    for c in "${PREV_BACKEND:-}" "${PREV_FRONTEND:-}" "${PREV_POSTGRES:-}"; do
+      [[ -n "$c" ]] && docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+  )
+fi
+
+ids="$(docker ps -aq --filter "label=com.dwd.app=dance-with-death" || true)"
+[[ -n "$ids" ]] && docker rm -f $ids >/dev/null 2>&1 || true
+
+REQUESTED_BACKEND_PORT="${BACKEND_PORT:-}"
+REQUESTED_FRONTEND_PORT="${FRONTEND_PORT:-}"
+REQUESTED_POSTGRES_PORT="${POSTGRES_PORT:-}"
+
+use_or_find_port() {
+  local requested="$1"
+  local fallback="$2"
+  local label="$3"
+  if [[ -n "$requested" ]]; then
+    if ! port_free "$requested"; then
+      echo "$label $requested is already in use."
+      exit 1
+    fi
+    echo "$requested"
+  else
+    find_port "$fallback"
+  fi
+}
+
+BACKEND_PORT="$(use_or_find_port "$REQUESTED_BACKEND_PORT" 8000 BACKEND_PORT)"
+FRONTEND_PORT="$(use_or_find_port "$REQUESTED_FRONTEND_PORT" 3000 FRONTEND_PORT)"
+POSTGRES_PORT="$(use_or_find_port "$REQUESTED_POSTGRES_PORT" 5432 POSTGRES_PORT)"
+
+if [[ "$FRONTEND_PORT" == "$BACKEND_PORT" ]]; then
+  if [[ -n "$REQUESTED_FRONTEND_PORT" || -n "$REQUESTED_BACKEND_PORT" ]]; then
+    echo "FRONTEND_PORT and BACKEND_PORT cannot be the same."
+    exit 1
+  fi
+  FRONTEND_PORT="$(find_port $((FRONTEND_PORT + 1)))"
+fi
+if [[ "$POSTGRES_PORT" == "$BACKEND_PORT" || "$POSTGRES_PORT" == "$FRONTEND_PORT" ]]; then
+  if [[ -n "$REQUESTED_POSTGRES_PORT" ]]; then
+    echo "POSTGRES_PORT cannot match the frontend or API port."
+    exit 1
+  fi
+  while [[ "$POSTGRES_PORT" == "$BACKEND_PORT" || "$POSTGRES_PORT" == "$FRONTEND_PORT" ]]; do
+    POSTGRES_PORT="$(find_port $((POSTGRES_PORT + 1)))"
+  done
+fi
+
+SITE_URL="http://localhost:${FRONTEND_PORT}"
+API_URL="http://localhost:${BACKEND_PORT}"
+APP_URL="$API_URL"
+FRONTEND_URL="${FRONTEND_URL:-$SITE_URL}"
+NUXT_PUBLIC_API_BASE="${API_URL}/api"
+CORS_ALLOWED_ORIGINS="$SITE_URL"
+
+export BACKEND_PORT FRONTEND_PORT POSTGRES_PORT
+export APP_URL FRONTEND_URL NUXT_PUBLIC_API_BASE CORS_ALLOWED_ORIGINS
+
+echo "ports  front:$FRONTEND_PORT  api:$BACKEND_PORT  db:$POSTGRES_PORT"
+
+docker compose --env-file "$ENV_FILE" up -d --build --force-recreate --remove-orphans
+
+mkdir -p "$STATE_DIR"
+cat > "$STATE_FILE" <<EOF
+PREV_BACKEND=${BACKEND_CONTAINER_NAME}
+PREV_FRONTEND=${FRONTEND_CONTAINER_NAME}
+PREV_POSTGRES=${POSTGRES_CONTAINER_NAME}
+PREV_PROJECT=${COMPOSE_PROJECT_NAME}
+DEPLOY_ID=${DEPLOY_ID}
+BACKEND_PORT=${BACKEND_PORT}
+FRONTEND_PORT=${FRONTEND_PORT}
+POSTGRES_PORT=${POSTGRES_PORT}
+DEPLOYED_AT=$(date -Iseconds)
+EOF
+
+echo
+echo "done"
+echo "  front  ${SITE_URL}"
+echo "  api    ${NUXT_PUBLIC_API_BASE}"
+echo "  db     localhost:${POSTGRES_PORT}  (data: $POSTGRES_DATA_PATH)"

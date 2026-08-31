@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+container="$(docker ps -q \
+  --filter "label=com.dwd.app=dance-with-death" \
+  --filter "label=com.dwd.service=backend" \
+  | head -n1)"
+
+if [[ -z "$container" ]]; then
+  echo "No backend is running. Start the stack first:"
+  echo "  ./deploy"
+  exit 1
+fi
+
+flags=(-i)
+[[ -t 0 && -t 1 ]] && flags+=(-t)
+
+docker exec "${flags[@]}" "$container" php artisan admin:create "$@"
